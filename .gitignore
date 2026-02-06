@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+.DS_Store
+
+# Virtual environments
+.venv
+
+# Evaluation trace logs
+logs/
+
+# Downloaded CTU databases (zipped version tracked with Git LFS)
+*.duckdb
