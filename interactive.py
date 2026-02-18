@@ -14,18 +14,40 @@ from rich.prompt import Prompt
 from framework.agent import Agent, Tool
 from framework.llm import OpenRouterConfig
 from framework.stream_printer import StreamPrinter
+from tools.business_rules import GET_BUSINESS_RULES
+from tools.check_sql import CHECK_SQL, configure as configure_check_sql
+from tools.execute_sql import EXECUTE_SQL
+from tools.generate_sql import configure as configure_generate_sql
+from tools.generate_sql import create_generate_sql_tool
+from tools.schema_info import DESCRIBE_TABLE, LIST_SCHEMAS
+from tools.search_column import SEARCH_COLUMN
 from tools.submit_answer import SUBMIT_ANSWER
 
 
-def create_tools() -> dict[str, Tool]:
+def create_tools(config: OpenRouterConfig) -> dict[str, Tool]:
     """Create the tools for the agent.
+
+    Args:
+        config: LLM config (used for generate_sql nl2sql model).
 
     Returns:
         Dictionary mapping tool names to Tool instances.
     """
+    configure_generate_sql(
+        api_key=config.api_key,
+        nl2sql_model=config.nl2sql_model,
+    )
+    configure_check_sql(api_key=config.api_key)
+    gen_sql_tool = create_generate_sql_tool()
     return {
         SUBMIT_ANSWER.name: SUBMIT_ANSWER,
-        # You can add your own tools here to test!
+        EXECUTE_SQL.name: EXECUTE_SQL,
+        LIST_SCHEMAS.name: LIST_SCHEMAS,
+        DESCRIBE_TABLE.name: DESCRIBE_TABLE,
+        SEARCH_COLUMN.name: SEARCH_COLUMN,
+        GET_BUSINESS_RULES.name: GET_BUSINESS_RULES,
+        CHECK_SQL.name: CHECK_SQL,
+        gen_sql_tool.name: gen_sql_tool,
     }
 
 
@@ -40,9 +62,9 @@ def create_agent(api_key: str) -> Agent:
     """
     config = OpenRouterConfig(
         api_key=api_key,
-        # Defaults to gpt-oss-120b on Cerebras
+        # minimax for tool call/routing, claude-opus-4.6 for NL2SQL
     )
-    tools = create_tools()
+    tools = create_tools(config)
     return Agent(config=config, tools=tools)
 
 

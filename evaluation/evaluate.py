@@ -49,6 +49,13 @@ from evaluation.compare import loosely_compare_dataframes
 from framework.agent import ANSWER_SUBMITTED_PREFIX, Agent, AgentEvent, EventType, Tool
 from framework.database import execute_query
 from framework.llm import OpenRouterConfig, TokenUsage
+from tools.business_rules import GET_BUSINESS_RULES
+from tools.check_sql import CHECK_SQL, configure as configure_check_sql
+from tools.execute_sql import EXECUTE_SQL
+from tools.generate_sql import configure as configure_generate_sql
+from tools.generate_sql import create_generate_sql_tool
+from tools.schema_info import DESCRIBE_TABLE, LIST_SCHEMAS
+from tools.search_column import SEARCH_COLUMN
 from tools.submit_answer import SUBMIT_ANSWER
 
 # =============================================================================
@@ -134,19 +141,33 @@ def save_trace(
 # =============================================================================
 
 
-def create_tools() -> dict[str, Tool]:
+def create_tools(config: OpenRouterConfig) -> dict[str, Tool]:
     """Create the tools for the agent.
 
     Modify this function to add or remove tools from the agent.
     The agent will have access to all tools returned by this function.
 
+    Args:
+        config: LLM config (used for generate_sql nl2sql model).
+
     Returns:
         A dictionary mapping tool names to Tool objects.
     """
+    configure_generate_sql(
+        api_key=config.api_key,
+        nl2sql_model=config.nl2sql_model,
+    )
+    configure_check_sql(api_key=config.api_key)
+    gen_sql_tool = create_generate_sql_tool()
     return {
         SUBMIT_ANSWER.name: SUBMIT_ANSWER,
-        # Add your custom tools here:
-        # MY_TOOL.name: MY_TOOL,
+        EXECUTE_SQL.name: EXECUTE_SQL,
+        LIST_SCHEMAS.name: LIST_SCHEMAS,
+        DESCRIBE_TABLE.name: DESCRIBE_TABLE,
+        SEARCH_COLUMN.name: SEARCH_COLUMN,
+        GET_BUSINESS_RULES.name: GET_BUSINESS_RULES,
+        CHECK_SQL.name: CHECK_SQL,
+        gen_sql_tool.name: gen_sql_tool,
     }
 
 
@@ -564,7 +585,7 @@ def _run_single_eval_worker(
     case: EvalCase,
     case_index: int,
     tools: dict[str, Tool],
-    api_key: str,
+    llm_config: OpenRouterConfig,
     log_dir: Path | None = None,
     verbose: bool = False,
 ) -> tuple[int, EvalResult]:
@@ -576,7 +597,7 @@ def _run_single_eval_worker(
         case: The evaluation case to run.
         case_index: Index of the case (for ordering results).
         tools: Tools to provide to the agent.
-        api_key: OpenRouter API key.
+        llm_config: OpenRouter config (minimax for routing, nl2sql_model for SQL).
         log_dir: Optional directory to save agent traces to.
         verbose: Whether to enable verbose logging.
 
@@ -587,7 +608,6 @@ def _run_single_eval_worker(
     eval_config = EvalConfig(verbose=verbose, log_dir=log_dir)
 
     # Each worker creates its own agent to avoid shared state
-    llm_config = OpenRouterConfig(api_key=api_key)
     agent = Agent(config=llm_config, tools=tools)
     result = run_single_eval(agent, case, eval_config)
     return case_index, result
@@ -597,7 +617,7 @@ def evaluate_split(
     tools: dict[str, Tool],
     eval_file: Path,
     console: Console,
-    api_key: str,
+    llm_config: OpenRouterConfig,
     concurrency: int = 1,
     log_dir: Path | None = None,
     max_cases: int | None = None,
@@ -609,7 +629,7 @@ def evaluate_split(
         tools: Tools to provide to the agent.
         eval_file: Path to the evaluation JSON file.
         console: Rich console for output.
-        api_key: OpenRouter API key.
+        llm_config: OpenRouter config (minimax for routing, nl2sql for SQL).
         concurrency: Number of parallel evaluations to run.
         log_dir: Optional directory to save agent traces to.
         max_cases: Optional limit on the number of cases to run.
@@ -641,7 +661,6 @@ def evaluate_split(
 
     if concurrency == 1:
         # Sequential execution (original behavior)
-        llm_config = OpenRouterConfig(api_key=api_key)
         agent = Agent(config=llm_config, tools=tools)
         eval_config = EvalConfig(verbose=verbose, log_dir=split_log_dir)
 
@@ -683,7 +702,7 @@ def evaluate_split(
                         case,
                         idx,
                         tools,
-                        api_key,
+                        llm_config,
                         split_log_dir,
                         verbose,
                     ): idx
@@ -972,8 +991,9 @@ def main() -> None:
     console.print("[bold]SQL Agent Evaluation[/bold]")
     console.print("[dim]Loading tools and preparing agent...[/dim]\n")
 
-    # Get tools from the configurable function
-    tools = create_tools()
+    # Create config and tools (minimax for routing, claude-opus-4.6 for NL2SQL)
+    llm_config = OpenRouterConfig(api_key=args.api_key)
+    tools = create_tools(llm_config)
     console.print(f"[dim]Agent tools: {', '.join(tools.keys())}[/dim]")
     if args.concurrency > 1:
         console.print(f"[dim]Concurrency: {args.concurrency}[/dim]")
@@ -1013,7 +1033,7 @@ def main() -> None:
                 tools,
                 eval_file,
                 console,
-                args.api_key,
+                llm_config,
                 args.concurrency,
                 log_dir,
                 max_cases,

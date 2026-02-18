@@ -11,6 +11,7 @@ from enum import Enum, auto
 from typing import Any
 
 from framework.llm import OpenRouterClient, OpenRouterConfig, TokenUsage
+from framework.verifier import Verifier
 
 # Prefix that indicates the agent should stop (answer was submitted)
 # This avoids global state - the tool result signals completion
@@ -234,6 +235,13 @@ class Agent:
     Only supports a single model, streaming, and an extensible tool set.
     """
 
+    # Pre-submission verifier model (used by all Agent instances)
+    VERIFIER_MODEL = "moonshotai/kimi-k2.5"
+    # Guide-retrieval validator model
+    GUIDE_VALIDATOR_MODEL = "openai/gpt-oss-120b:nitro"
+    # Max times the verifier can reject before we let submit_answer through
+    MAX_VERIFY_REJECTIONS = 1
+
     def __init__(self, config: OpenRouterConfig, tools: dict[str, Tool]):
         self.config = config
         self.tools: dict[str, Tool] = tools  # mapping from tool name to tool object
@@ -244,6 +252,22 @@ class Agent:
             keep_recent=config.compress_keep_recent,
             max_chars=config.compress_max_chars,
         )
+
+        # Pre-submission SQL verifier (secondary LLM)
+        self._verifier = Verifier(
+            api_key=config.api_key,
+            model=self.VERIFIER_MODEL,
+        )
+        self._verify_rejections = 0
+        self._original_prompt = ""
+
+        # Initialise the business-rules guide validator (Stage 3)
+        from tools.business_rules import init_guide_validator
+        init_guide_validator(
+            api_key=config.api_key,
+            model=self.GUIDE_VALIDATOR_MODEL,
+        )
+
         self.reset_conversation()
 
     def _get_tool_definitions(self) -> list[dict[str, Any]]:
@@ -264,17 +288,93 @@ class Agent:
         """Execute a tool call and return the result as a string.
 
         Guaranteed to return a string, swallowing exceptions.
+
+        For ``submit_answer``, a pre-submission verification step is run
+        using a secondary LLM.  If the verifier finds issues, the SQL is
+        **not** submitted; instead the feedback is returned so the agent
+        can fix the query and retry within its normal iteration loop.
+        After ``MAX_VERIFY_REJECTIONS`` consecutive rejections the query
+        is submitted regardless to avoid infinite loops.
         """
         if tool_call.error:
             return f"Error parsing arguments for tool '{tool_call.name}': {tool_call.error}"
 
         if tool_call.name not in self.tools:
             return f"Error: Unknown tool '{tool_call.name}'"
+
+        # ── Pre-submission verification gate ──
+        if (
+            tool_call.name == "submit_answer"
+            and self._verify_rejections < self.MAX_VERIFY_REJECTIONS
+        ):
+            sql = tool_call.arguments.get("query", "")
+            ctx = self._get_verification_context()
+            result = self._verifier.verify(
+                question=self._original_prompt,
+                submitted_sql=sql,
+                business_rules=ctx["business_rules"],
+                schema_info=ctx["schema_info"],
+            )
+            if not result.passed:
+                self._verify_rejections += 1
+                return (
+                    f"⚠ PRE-SUBMISSION VERIFICATION FAILED "
+                    f"(attempt {self._verify_rejections}/"
+                    f"{self.MAX_VERIFY_REJECTIONS}).\n"
+                    "Your query was NOT submitted. Fix the issues "
+                    "below, then call submit_answer again.\n\n"
+                    f"{result.feedback}"
+                )
+
         tool = self.tools[tool_call.name]
         try:
             return tool.function(**tool_call.arguments)
         except Exception as e:
             return f"Error executing {tool_call.name}: {e}"
+
+    # -----------------------------------------------------------------
+    # Verification helpers
+    # -----------------------------------------------------------------
+
+    def _get_verification_context(self) -> dict[str, str]:
+        """Extract business rules and schema info from conversation history.
+
+        Scans all tool-result messages and accumulates every
+        ``get_business_rules`` response (there may be multiple calls for
+        different domains) as well as every ``describe_table`` /
+        ``list_schemas`` output, so the verifier has the same full context
+        the agent used during this run.
+        """
+        rules_parts: list[str] = []
+        schema_parts: list[str] = []
+
+        for i, msg in enumerate(self.conversation.messages):
+            if msg.role != "tool" or not msg.content:
+                continue
+            tool_name = self._tool_name_for_result(i)
+            if tool_name == "get_business_rules" and not msg.content.startswith("No"):
+                rules_parts.append(msg.content)
+            elif tool_name in ("describe_table", "list_schemas"):
+                schema_parts.append(msg.content)
+
+        return {
+            "business_rules": "\n\n---\n\n".join(rules_parts)[:6000],
+            "schema_info": "\n".join(schema_parts)[:5000],
+        }
+
+    def _tool_name_for_result(self, tool_msg_index: int) -> str:
+        """Given the index of a tool-result message, return the tool name."""
+        target_id = self.conversation.messages[tool_msg_index].tool_call_id
+        if not target_id:
+            return ""
+        for j in range(tool_msg_index - 1, -1, -1):
+            tc_list = self.conversation.messages[j].tool_calls
+            if self.conversation.messages[j].role == "assistant" and tc_list:
+                for tc in tc_list:
+                    if tc.get("id") == target_id:
+                        return tc.get("function", {}).get("name", "")
+                break
+        return ""
 
     def _generate_response(self, conversation: Conversation) -> Iterator[AgentEvent]:
         """Generate a response from the model, streaming the events out."""
@@ -342,22 +442,280 @@ class Agent:
 
         yield AgentEvent(type=EventType.GENERATION_END, data=event_data)
 
-    def _get_system_message(self) -> str:
+    def _get_system_message(self) -> str:  # noqa: PLR6301
         """Get the system message for the agent."""
         return (
-            "You are an autonomous SQL agent. You must complete tasks independently "
-            "without asking the user for clarification or additional information. "
-            "Use the available tools to gather any information you need. "
-            "If you're uncertain, make your best assumptions and proceed.\n\n"
-            "CRITICAL: You MUST call the 'submit_answer' tool to complete EVERY task. "
-            "NEVER stop without calling submit_answer. Even if you've computed the answer, "
-            "you MUST submit it via submit_answer with a valid SQL query.\n\n"
-            "Do not provide answers as plain text - always use the submit_answer tool "
-            "with a valid SQL query that generates a dataframe with the intended answer."
+            "You are an autonomous SQL agent working with a DuckDB "
+            "database. You answer user questions by submitting a SQL "
+            "query via the submit_answer tool.\n\n"
+            #
+            # ── WORKFLOW ──
+            #
+            "WORKFLOW — follow these steps in order for EVERY "
+            "question:\n\n"
+            "1. RETRIEVE BUSINESS RULES: Call get_business_rules "
+            "with a keyword related to the question domain (e.g. "
+            "the schema name, sport, industry, or topic). Read the "
+            "returned rules **line by line** — they define critical "
+            "filters, exclusions, thresholds, classifications, and "
+            "calculations you MUST apply in your SQL. "
+            "If the response ends with 'Other potentially relevant "
+            "guides: ...' AND those guides seem related to the "
+            "question, call get_business_rules again with one of "
+            "those guide names to retrieve additional rules. A "
+            "question spanning two domains (e.g. Airline + Finance) "
+            "may need two separate calls.\n\n"
+            "2. EXPLORE SCHEMA: Call list_schemas to see available "
+            "schemas and tables. Then call describe_table for every "
+            "relevant table to see the **exact** column names, "
+            "types, and sample data. Always use the real column "
+            "names you see in describe_table — never guess. "
+            "If a business rule mentions a concept (e.g. 'delay', "
+            "'carrier', 'on-time') and you are unsure which column "
+            "holds it, call search_column with that keyword to find "
+            "all matching columns across every table.\n\n"
+            "3. GENERATE AND TEST SQL: Call generate_sql with the "
+            "question, schema_info (from describe_table), and "
+            "business_rules (from get_business_rules). Use the "
+            "returned SQL in execute_sql to test it.\n"
+            "   - If execute_sql returns an error, call generate_sql "
+            "again with previous_sql and error_message to fix it.\n"
+            "   - If results look wrong, call generate_sql again with "
+            "updated context. You may iterate multiple times.\n\n"
+            "4. PRE-SUBMISSION CHECK: Call check_sql with the "
+            "question, your SQL, the business_rules text, and "
+            "schema_info. If it reports issues, fix them and call "
+            "check_sql again before submitting. Only skip check_sql "
+            "if you have already been through a rejection cycle.\n\n"
+            "5. SUBMIT: Once check_sql returns LGTM (or you have "
+            "already addressed its feedback), call submit_answer.\n\n"
+            #
+            # ── APPLYING BUSINESS RULES ──
+            #
+            "APPLYING BUSINESS RULES (CRITICAL):\n\n"
+            "After retrieving business rules, you MUST translate "
+            "EVERY applicable rule into SQL. Go through each rule "
+            "and ask: 'Does this rule apply to my query?' If yes, "
+            "it MUST appear in your SQL as a WHERE filter, HAVING "
+            "clause, CASE expression, or JOIN condition. Common "
+            "patterns:\n\n"
+            "a) EXCLUSION rules → add to WHERE clause.\n"
+            "   When a rule says 'exclude X' or 'exclude rows where "
+            "condition Y', add the corresponding WHERE condition.\n\n"
+            "b) CLASSIFICATION rules → use CASE WHEN.\n"
+            "   When a rule maps codes to labels (e.g. status A = "
+            "'Good', B = 'Warning'), use CASE WHEN col = 'A' THEN "
+            "'Good' WHEN col = 'B' THEN 'Warning' ... END.\n\n"
+            "c) COMPLETED/ACTIVE-ENTITY rules → when rules say "
+            "'only count completed' or 'exclude cancelled', add "
+            "filters for non-null required fields and status flags.\n\n"
+            "d) EXTERNAL-FACTOR exclusion → when rules say to "
+            "exclude rows where an external factor is present "
+            "(e.g. weather, system error), add the appropriate "
+            "filter.\n\n"
+            "e) THRESHOLD rules → rules like 'within N minutes' "
+            "or 'over N hours' define exact thresholds. Use the "
+            "exact column and threshold from the rules. "
+            "'Within N' means <= N, not < N. Prefer columns that "
+            "store non-negative values for thresholds.\n\n"
+            "f) SUBTRACTION rules → when rules say to subtract "
+            "refunds or reversals from gross amounts, use "
+            "SUM(CASE WHEN ... THEN amt ELSE 0 END) - SUM(CASE "
+            "WHEN ... THEN amt ELSE 0 END), not just exclude.\n\n"
+            "g) DATE-CUTOFF rules → when rules mention legacy "
+            "data, migration dates, or 'from year X onwards', add "
+            "a date filter.\n\n"
+            "h) MINIMUM-THRESHOLD rules → add to WHERE or HAVING "
+            "depending on whether the threshold applies per row or "
+            "to an aggregate.\n\n"
+            #
+            # ── OUTPUT FORMAT RULES ──
+            #
+            "OUTPUT FORMAT RULES:\n\n"
+            "- Read the question carefully to identify EXACTLY "
+            "which columns are requested.\n"
+            "- If the question asks 'how many' or 'count', return "
+            "a single COUNT(*) value, not the full list of rows.\n"
+            "- Do NOT concatenate or merge columns unless the "
+            "question explicitly asks. Keep first name and last "
+            "name as separate columns.\n"
+            "- When UNSURE whether a column is expected, INCLUDE "
+            "it. Extra columns are NEVER penalized. Missing "
+            "columns or wrong values ARE penalized.\n"
+            "- Do NOT join to lookup/reference tables to resolve "
+            "IDs to names UNLESS the question explicitly asks for "
+            "names. If the question says 'by administrative unit' "
+            "or 'by carrier', return the raw column value from "
+            "the main table.\n"
+            "- Do NOT add ORDER BY unless the question implies "
+            "ordering (e.g. 'top N', 'highest', 'lowest', "
+            "'ranked'). Unnecessary ORDER BY is harmless but "
+            "unnecessary.\n"
+            "- If the question asks for 'top N', always include "
+            "ORDER BY ... DESC LIMIT N (or ASC for 'lowest').\n"
+            "- Use COUNT(DISTINCT col) when counting unique "
+            "entities that may appear in multiple rows.\n\n"
+            #
+            # ── NUMERIC PRECISION RULES ──
+            #
+            "NUMERIC PRECISION RULES (CRITICAL — wrong precision "
+            "causes mismatches):\n\n"
+            "- Do NOT apply ROUND() unless the question explicitly "
+            "says 'round to N decimal places'. ROUND changes "
+            "values and causes evaluation mismatches.\n"
+            "- Return rates and ratios as FRACTIONS (0.0–1.0) "
+            "using CAST(... AS REAL) / COUNT(*). Do NOT multiply "
+            "by 100 UNLESS the question explicitly says "
+            "'percentage' or 'percent'.\n"
+            "- Use integer division (a / b) when context implies "
+            "integers (e.g. counts, whole units). Use float "
+            "division (CAST(x AS REAL) or x * 1.0) only when the "
+            "context requires decimals.\n"
+            "- NEVER wrap results in ROUND() 'just to be clean'. "
+            "Raw computed values are expected.\n\n"
+            #
+            # ── FILTER RULES ──
+            #
+            "FILTER RULES:\n\n"
+            "- Do NOT add WHERE col IS NOT NULL unless the "
+            "question or business rules explicitly say to exclude "
+            "NULLs. NULL values in GROUP BY create their own "
+            "group, which is often the correct behavior.\n"
+            "- Do NOT add extra WHERE filters beyond what the "
+            "question and business rules specify. Every extra "
+            "filter risks changing the row count.\n"
+            "- When business rules say 'exclude status B from "
+            "calculation', use NOT IN ('B') which covers ALL "
+            "other statuses — do not enumerate them.\n\n"
+            #
+            # ── COLUMN NAME VERIFICATION ──
+            #
+            "COLUMN NAME VERIFICATION:\n\n"
+            "After calling describe_table, copy the EXACT column "
+            "names character-by-character into your query. Never "
+            "guess. If the business rules mention a concept "
+            "(e.g. delay, on-time, carrier), find the matching "
+            "column in describe_table — similar-sounding columns "
+            "may exist (e.g. delay vs delay_minutes) and have "
+            "different semantics. Use the one that matches the "
+            "rule's intent.\n\n"
+            #
+            # ── AGGREGATION RULES ──
+            #
+            "AGGREGATION vs ROW-LEVEL FILTERS:\n\n"
+            "- When a threshold applies to an AGGREGATED measure "
+            "(e.g. 'total X over a career', 'lifetime Y', "
+            "'at least N total'), use HAVING on SUM/COUNT.\n"
+            "  Example: 'at least 100 total X' →\n"
+            "  HAVING SUM(x_col) >= 100  (NOT WHERE x_col >= 100)\n"
+            "- When a threshold applies to individual rows "
+            "(e.g. 'at least 50 X per record', 'per season'), "
+            "use WHERE.\n"
+            "- Think carefully: does the question refer to a "
+            "per-row value or an aggregated total?\n\n"
+            #
+            # ── PRE-SUBMISSION CHECKLIST ──
+            #
+            "PRE-SUBMISSION CHECKLIST — verify ALL of these "
+            "before calling submit_answer:\n\n"
+            "1. COLUMNS: Does my SELECT include the columns the "
+            "question asked for? Did I accidentally add ROUND() "
+            "that wasn't requested? Did I multiply by 100 when "
+            "the question didn't say 'percentage'?\n"
+            "2. FILTERS: Did I apply every filter from the "
+            "business rules? Did I add any extra filters NOT in "
+            "the question or business rules (e.g. WHERE col IS "
+            "NOT NULL, WHERE col != '')? Remove them.\n"
+            "3. JOINS: Did I join to any table not needed for the "
+            "requested output? If the question asks for an ID, "
+            "do NOT join to get a name.\n"
+            "4. ROW COUNT: Does the result row count make sense "
+            "for the question? If it seems off, check filters.\n"
+            "5. COLUMN NAMES: Am I using the exact column names "
+            "from describe_table? No guessing.\n"
+            "6. AGGREGATION: For threshold filters, am I using "
+            "HAVING (for aggregated totals) vs WHERE (for "
+            "per-row values) correctly?\n\n"
+            #
+            # ── GENERAL RULES ──
+            #
+            "GENERAL RULES:\n"
+            "- Always use schema-qualified table names "
+            "(e.g. SchemaName.TableName).\n"
+            "- Apply ALL business rules from the guide — every "
+            "filter, exclusion, and classification. Missing even "
+            "one rule will produce wrong results.\n"
+            "- If execute_sql returns an error, DO NOT submit that "
+            "query. Fix it and test again.\n"
+            "- NEVER stop without calling submit_answer.\n"
+            "- Do not provide answers as plain text — always "
+            "submit via submit_answer.\n\n"
+            #
+            # ── EXAMPLE 1 ──
+            #
+            "EXAMPLE 1 — Applying classification rules:\n\n"
+            'User: "Show count and total by status classification."'
+            "\n\n"
+            'Step 1: get_business_rules("sales")\n'
+            "  → Rules say: status A = Good, B = Warning, "
+            "C/D = Bad.\n\n"
+            "Step 2: list_schemas() → Sales schema.\n"
+            "  describe_table(\"Sales\", \"orders\") → order_id, "
+            "amount, status, ...\n\n"
+            "Step 3: execute_sql(\n"
+            "  \"SELECT\n"
+            "     CASE WHEN status = 'A' THEN 'Good'\n"
+            "          WHEN status = 'B' THEN 'Warning'\n"
+            "          WHEN status IN ('C','D') THEN 'Bad'\n"
+            "     END AS classification,\n"
+            "     COUNT(*) AS cnt,\n"
+            "     SUM(amount) AS total\n"
+            "   FROM Sales.orders\n"
+            "   GROUP BY classification\")\n"
+            "  → 3 rows. Correct.\n\n"
+            "Step 4: check_sql(question=..., sql=..., "
+            "business_rules=..., schema_info=...)\n"
+            "  → LGTM\n\n"
+            "Step 5: submit_answer(query=\"SELECT CASE WHEN ...\")\n\n"
+            #
+            # ── EXAMPLE 2 ──
+            #
+            "EXAMPLE 2 — Applying exclusion and threshold rules:\n\n"
+            'User: "Metric by category, excluding invalid rows."'
+            "\n\n"
+            'Step 1: get_business_rules("analytics")\n'
+            "  → Rules say: exclude rows where flag = 1; use "
+            "delay_min column for 'on-time' (<= 15).\n\n"
+            "Step 2: describe_table(\"Analytics\", \"events\")\n"
+            "  → Columns: category, delay_min, flag, ...\n"
+            "  (Use delay_min, not delay_sec — check rules.)\n\n"
+            "Step 3: execute_sql(\n"
+            "  \"SELECT category,\n"
+            "     SUM(CASE WHEN delay_min <= 15 THEN 1 ELSE 0 END) "
+            "* 100.0 / COUNT(*) AS on_time_pct\n"
+            "   FROM Analytics.events\n"
+            "   WHERE flag != 1\n"
+            "   GROUP BY category\")\n"
+            "  → Results look correct.\n\n"
+            "Step 4: check_sql(question=..., sql=..., "
+            "business_rules=..., schema_info=...)\n"
+            "  → LGTM\n\n"
+            "Step 5: submit_answer(query=\"SELECT category, ...\")\n"
         )
 
     def run(self, prompt: str) -> Iterator[AgentEvent]:
-        """Run the agent with streaming output, from the user's natural language prompt."""
+        """Run the agent with streaming output, from the user's natural language prompt.
+
+        Pre-submission verification is handled inside ``_execute_tool``:
+        when the agent calls ``submit_answer``, a secondary LLM checks the
+        SQL first.  If the check fails the agent receives feedback and
+        continues its iteration loop to fix the query — no caller-side
+        changes required.
+        """
+        # Remember the original prompt for the verifier and reset counter
+        self._original_prompt = prompt
+        self._verify_rejections = 0
+
         # Add the new user message to the ongoing conversation
         self.conversation.messages.append(Message(role="user", content=prompt))
 
@@ -386,9 +744,13 @@ class Agent:
                 # Check if this is an empty response (model just stopped)
                 is_empty_response = not full_response or not full_response.strip()
 
-                # Check if response looks like a malformed tool call (JSON with "query" key)
-                # This happens when the model outputs tool call arguments as plain text
-                looks_like_failed_tool_call = (full_response and "{" in full_response)
+                # Check if response looks like a malformed tool call.
+                # This happens when the model emits JSON-ish tool arguments
+                # in assistant text instead of sending an actual tool call.
+                looks_like_failed_tool_call = _looks_like_malformed_tool_call_text(
+                    full_response,
+                    set(self.tools.keys()),
+                )
 
                 if is_empty_response or looks_like_failed_tool_call:
                     # Model returned empty response or malformed tool call
@@ -516,3 +878,64 @@ def _parse_tool_calls_from_api(tool_calls_data: list[dict[str, Any]]) -> list[To
         )
 
     return tool_calls
+
+
+def _looks_like_malformed_tool_call_text(
+    text: str,
+    tool_names: set[str],
+) -> bool:
+    """Heuristic detector for failed tool calls emitted as plain text.
+
+    We only mark as malformed when the assistant output strongly resembles
+    tool-call JSON, for example:
+    - {"query": "..."}                        (raw arguments only)
+    - {"name":"submit_answer","arguments":...} (tool envelope)
+    - ```json { ... } ```                     (wrapped JSON)
+
+    This avoids false positives from normal prose that merely contains "{"
+    characters.
+    """
+    if not text or not text.strip():
+        return False
+
+    raw = text.strip()
+
+    # Try to pull inner JSON from fenced block if present.
+    if raw.startswith("```") and raw.endswith("```"):
+        lines = raw.splitlines()
+        if len(lines) >= 3:
+            raw = "\n".join(lines[1:-1]).strip()
+
+    if not (raw.startswith("{") and raw.endswith("}")):
+        return False
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+
+    if not isinstance(payload, dict):
+        return False
+
+    keys = set(payload.keys())
+
+    # Common "arguments-only" payload shape that should have been a tool call.
+    arg_like_keys = {
+        "query", "question", "sql", "schema_name", "table_name", "search_term",
+        "keyword", "business_rules", "schema_info", "previous_sql", "error_message",
+    }
+    if keys and keys.issubset(arg_like_keys):
+        return True
+
+    # OpenAI-style tool envelope emitted as plain text.
+    if "name" in payload and "arguments" in payload:
+        name = str(payload.get("name", ""))
+        if name in tool_names:
+            return True
+
+    if "tool" in payload and "arguments" in payload:
+        name = str(payload.get("tool", ""))
+        if name in tool_names:
+            return True
+
+    return False
